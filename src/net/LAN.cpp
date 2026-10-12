@@ -43,10 +43,44 @@
 #endif
 
 #include "LAN.h"
+#include <chrono>
+
+// Marks the LAN socket as low-latency (DSCP EF). Wi-Fi access points and phones that support WMM then put these packets
+// in the voice queue, which is not held back by Wi-Fi power saving. Between two handhelds the DS multiplayer exchange
+// waits for a reply every frame, so every ms of round trip time here costs frame rate
+static void MarkLowLatency(ENetHost* host)
+{
+#ifndef __WIN32__
+    if (!host) return;
+    int tos = 0xB8;
+    setsockopt((int)host->socket, IPPROTO_IP, IP_TOS, (const void*)&tos, sizeof(tos));
+#endif
+}
 
 
 namespace melonDS
 {
+
+// Diagnostic counters, reported once per second from LAN::Process
+static u64 DbgNowUs()
+{
+    return (u64)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static u64 DbgWaitUs = 0, DbgWaitMaxUs = 0, DbgWaitCalls = 0, DbgLastReportUs = 0;
+struct DbgWaitTimer
+{
+    u64 start;
+    DbgWaitTimer() : start(DbgNowUs()) {}
+    ~DbgWaitTimer()
+    {
+        u64 e = DbgNowUs() - start;
+        DbgWaitUs += e;
+        if (e > DbgWaitMaxUs) DbgWaitMaxUs = e;
+        DbgWaitCalls++;
+    }
+};
+static u32 DbgSent = 0, DbgSentMax = 0, DbgRecvHostTimeout = 0, DbgRecvHostOk = 0, DbgRepliesNone = 0, DbgRepliesSome = 0, DbgStale = 0, DbgGotMP = 0;
+
 
 const u32 kDiscoveryMagic = 0x444E414C; // LAND
 const u32 kLANMagic = 0x504E414C; // LANP
@@ -95,7 +129,9 @@ LAN::LAN() noexcept : Inited(false)
 
     ConnectedBitmask = 0;
 
-    MPRecvTimeout = 25;
+    // Raised from 25 ms: Wi-Fi between two handhelds has more jitter than a wired LAN, and a reply that arrives
+    // a few ms late was being treated as lost, which the game reports as a communication error
+    MPRecvTimeout = 200;
     LastHostID = -1;
     LastHostPeer = nullptr;
 
@@ -231,6 +267,7 @@ bool LAN::StartHost(const char* playername, int numplayers)
     addr.port = kLANPort;
 
     Host = enet_host_create(&addr, 16, 2, 0, 0);
+    MarkLowLatency(Host);
     if (!Host)
     {
         return false;
@@ -266,6 +303,7 @@ bool LAN::StartClient(const char* playername, const char* host)
     if (!Inited) return false;
 
     Host = enet_host_create(nullptr, 16, 2, 0, 0);
+    MarkLowLatency(Host);
     if (!Host)
     {
         return false;
@@ -573,6 +611,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
             if (!player) break;
 
             ConnectedBitmask &= ~(1 << player->ID);
+            Platform::Log(Platform::LogLevel::Info, "LAN-DBG: ENet peer %d DISCONNECTED/TIMED OUT\n", player->ID);
 
             int id = player->ID;
             RemotePeers[id] = nullptr;
@@ -636,6 +675,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
                     if (!player) break;
 
                     ConnectedBitmask |= (1 << player->ID);
+                    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: peer %d signalled MP ready, bitmask=%04X\n", player->ID, ConnectedBitmask);
                 }
                 break;
 
@@ -646,6 +686,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
                     if (!player) break;
 
                     ConnectedBitmask &= ~(1 << player->ID);
+                    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: peer %d signalled MP stopped, bitmask=%04X\n", player->ID, ConnectedBitmask);
                 }
                 break;
             }
@@ -697,6 +738,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
             if (!player) break;
 
             ConnectedBitmask &= ~(1 << player->ID);
+            Platform::Log(Platform::LogLevel::Info, "LAN-DBG: ENet peer %d DISCONNECTED/TIMED OUT\n", player->ID);
 
             int id = player->ID;
             RemotePeers[id] = nullptr;
@@ -762,6 +804,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
                     if (!player) break;
 
                     ConnectedBitmask |= (1 << player->ID);
+                    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: peer %d signalled MP ready, bitmask=%04X\n", player->ID, ConnectedBitmask);
                 }
                 break;
 
@@ -772,6 +815,7 @@ void LAN::ProcessClientEvent(ENetEvent& event)
                     if (!player) break;
 
                     ConnectedBitmask &= ~(1 << player->ID);
+                    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: peer %d signalled MP stopped, bitmask=%04X\n", player->ID, ConnectedBitmask);
                 }
                 break;
             }
@@ -811,10 +855,23 @@ void LAN::ProcessLAN(int type)
         MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
         u32 packettime = header->Magic;
 
-        if ((packettime > time_last) || (packettime < (time_last - 16)))
+        // Ordinary 802.11 frames (beacons, join requests and replies) must survive until the emulated wifi chip next
+        // listens. A DS host only listens for a short window after each of its beacons, and over real Wi-Fi a client's
+        // join request arrives after that window has closed, so dropping it after a few ms makes every join fail
+        // with a "communication error". MP command/reply frames stay strict, they are only valid for about a frame
+        u32 maxage = (header->Type == 0) ? 350 : 150;
+
+        if ((packettime > time_last) || (packettime < (time_last - maxage)))
         {
+            static int dbgStaleLogs = 0;
+            if (dbgStaleLogs < 60)
+            {
+                dbgStaleLogs++;
+                Platform::Log(Platform::LogLevel::Info, "LAN-DBG: dropped stale packet type=%u age=%ums\n", (unsigned)header->Type, (unsigned)(time_last - packettime));
+            }
             RXQueue.pop();
             enet_packet_destroy(enetpacket);
+            DbgStale++;
         }
         else
         {
@@ -863,6 +920,7 @@ void LAN::ProcessLAN(int type)
 
                 event.packet->userData = event.peer;
                 RXQueue.push(event.packet);
+                DbgGotMP++;
 
                 // return now -- if we are receiving MP frames, if we keep going
                 // we'll consume too many even if we have no timeout set
@@ -897,6 +955,22 @@ void LAN::Process()
     {
         FrameCount = 0;
 
+        if (DbgSent || DbgGotMP || DbgRecvHostOk || DbgRecvHostTimeout || DbgRepliesNone || DbgRepliesSome)
+        {
+            u64 nowUs = DbgNowUs();
+            double windowMs = DbgLastReportUs ? (nowUs - DbgLastReportUs) / 1000.0 : 0.0;
+            DbgLastReportUs = nowUs;
+            Platform::Log(Platform::LogLevel::Info,
+                "LAN-DBG: TIMING 60 frames took %.0f ms (%.1f fps), waiting on peer: avg %.2f ms, max %.2f ms over %u waits\n",
+                windowMs, windowMs > 0 ? 60000.0 / windowMs : 0.0,
+                DbgWaitCalls ? (DbgWaitUs / 1000.0) / DbgWaitCalls : 0.0, DbgWaitMaxUs / 1000.0, (unsigned)DbgWaitCalls);
+            DbgWaitUs = DbgWaitMaxUs = DbgWaitCalls = 0;
+            Platform::Log(Platform::LogLevel::Info,
+                "LAN-DBG: 1s stats: sent=%u gotMP=%u hostPktOk=%u hostPktTimeout=%u repliesGot=%u repliesNone=%u stale=%u bitmask=%04X myid=%d\n",
+                DbgSent, DbgGotMP, DbgRecvHostOk, DbgRecvHostTimeout, DbgRepliesSome, DbgRepliesNone, DbgStale, ConnectedBitmask, MyPlayer.ID);
+            DbgSent = DbgGotMP = DbgRecvHostOk = DbgRecvHostTimeout = DbgRepliesNone = DbgRepliesSome = DbgStale = 0;
+        }
+
         Platform::Mutex_Lock(PlayersMutex);
 
         for (int i = 0; i < 16; i++)
@@ -916,6 +990,7 @@ void LAN::Process()
 void LAN::Begin(int inst)
 {
     if (!Host) return;
+    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: Begin (game started MP) host=%d myid=%d bitmask=%04X\n", IsHost?1:0, MyPlayer.ID, ConnectedBitmask);
 
     ConnectedBitmask |= (1 << MyPlayer.ID);
     LastHostID = -1;
@@ -929,6 +1004,7 @@ void LAN::Begin(int inst)
 void LAN::End(int inst)
 {
     if (!Host) return;
+    Platform::Log(Platform::LogLevel::Info, "LAN-DBG: End (game stopped MP) myid=%d bitmask=%04X\n", MyPlayer.ID, ConnectedBitmask);
 
     ConnectedBitmask &= ~(1 << MyPlayer.ID);
 
@@ -946,6 +1022,7 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
     //u32 flags = ENET_PACKET_FLAG_RELIABLE;
     u32 flags = ENET_PACKET_FLAG_UNSEQUENCED;
 
+    DbgSent++;
     ENetPacket* enetpacket = enet_packet_create(nullptr, sizeof(MPPacketHeader)+len, flags);
 
     MPPacketHeader pktheader;
@@ -1026,26 +1103,36 @@ int LAN::SendAck(int inst, u8* packet, int len, u64 timestamp)
 
 int LAN::RecvHostPacket(int inst, u8* packet, u64* timestamp)
 {
+    DbgWaitTimer dbgTimer;
     if (LastHostID != -1)
     {
         // check if the host is still connected
 
         if (!(ConnectedBitmask & (1<<LastHostID)))
+        {
+            Platform::Log(Platform::LogLevel::Info, "LAN-DBG: RecvHostPacket: host %d not in bitmask %04X -> -1\n", LastHostID, ConnectedBitmask);
             return -1;
+        }
     }
 
-    return RecvPacketGeneric(packet, true, timestamp);
+    int r = RecvPacketGeneric(packet, true, timestamp);
+    if (r > 0) DbgRecvHostOk++; else DbgRecvHostTimeout++;
+    return r;
 }
 
 u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
 {
     if (!Host) return 0;
+    DbgWaitTimer dbgTimer;
 
     u16 ret = 0;
     u16 myinstmask = 1 << MyPlayer.ID;
 
     if ((myinstmask & ConnectedBitmask) == ConnectedBitmask)
+    {
+        DbgRepliesNone++;
         return 0;
+    }
 
     for (;;)
     {
@@ -1053,6 +1140,7 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
         if (RXQueue.empty())
         {
             // no more replies available
+            if (ret) DbgRepliesSome++; else DbgRepliesNone++;
             return ret;
         }
 

@@ -1605,10 +1605,22 @@ bool Wifi::CheckRX(int type) // 0=regular 1=MP replies 2=MP host frames
         }
 
         chan = RXBuffer[9];
-        if (chan != CurChannel || CurChannel == 0)
+        if (CurChannel == 0)
         {
-            Log(LogLevel::Debug, "received frame but bad channel %d (expected %d)\n", chan, CurChannel);
+            Log(LogLevel::Debug, "received frame but radio has no channel (frame channel %d)\n", chan);
             continue;
+        }
+        // LemonDS: frames come over a network cable-less LAN link, not a real radio, so the channel is meaningless.
+        // Two emulated consoles can end up hopping over different channel lists (for example 1/7/13 vs 1/6/11) and
+        // would never hear each other if frames on a different channel were dropped. Accept them and just log it.
+        if (chan != CurChannel)
+        {
+            static int dbgChanLogs = 0;
+            if (dbgChanLogs < 20)
+            {
+                dbgChanLogs++;
+                Log(LogLevel::Info, "LAN-DBG: accepting frame sent on channel %d while listening on %d\n", chan, CurChannel);
+            }
         }
 
         // hack: ignore MP frames if not engaged in a MP comm

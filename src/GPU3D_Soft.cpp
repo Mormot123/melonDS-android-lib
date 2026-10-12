@@ -27,6 +27,12 @@
 namespace melonDS
 {
 
+// LemonDS: set by the frontend to skip 3D rasterization for this frame (frameskip).
+// The previous 3D image is reused; 2D layers keep updating normally.
+bool LemonSkip3D = false;
+static bool LemonStale3D = false;
+
+
 void RenderThreadFunc();
 
 
@@ -1748,7 +1754,10 @@ void SoftRenderer::RenderFrame(GPU& gpu)
     bool textureChanged = gpu.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
 
-    FrameIdentical = !(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical;
+    const bool lemonSkip = LemonSkip3D;
+    // If the last frame was skipped the buffer is stale, so it can't be treated as identical
+    FrameIdentical = (!(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical && !LemonStale3D) || lemonSkip;
+    LemonStale3D = lemonSkip;
 
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
